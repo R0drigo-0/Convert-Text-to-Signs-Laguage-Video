@@ -1,115 +1,110 @@
 import os
 import re
 import json
-import math
+import shutil
 import requests
 import traceback
 import nltk
+from concurrent.futures import ThreadPoolExecutor
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from moviepy.editor import concatenate_videoclips
-from pytube import YouTube
 from nltk.stem import WordNetLemmatizer
-from concurrent.futures import ThreadPoolExecutor
+from pytube import YouTube
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 # Download necessary NLTK data
 nltk.download("wordnet")
 nltk.download("omw-1.4")
+
 lemmatizer = WordNetLemmatizer()
 
 # Function Definitions
+
 
 def read_json_file(file_path):
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             return json.load(file)
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"Error reading JSON file: {e}")
+        logging.error(f"Error reading JSON file: {e}")
         return None
+
 
 def parse_srt_file(file_path):
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             lines = file.readlines()
     except FileNotFoundError:
-        print("SRT file not found.")
+        logging.error("SRT file not found.")
         return None
 
-    subtitle_data = []
-    word = ""
-    start_time_srt = ""
-    end_time_srt = ""
+    words = []
 
     for line in lines:
         line = line.strip()
-        if re.match(r"^\d+$", line):
-            if word:
-                subtitle_data.append((word.strip(), start_time_srt, end_time_srt))
-                word = ""
+        # Skip index and timecode lines
+        if re.match(r"^\d+$", line) or "-->" in line or line == "":
             continue
-        elif "-->" in line:
-            times = re.findall(r"\d{2}:\d{2}:\d{2},\d{3}", line)
-            start_time_srt, end_time_srt = times
-            continue
-        elif line == "":
-            continue
-        else:
-            word += " " + line
+        # Split line into words and add to the list
+        words.extend(line.split())
 
-    if word:
-        subtitle_data.append((word.strip(), start_time_srt, end_time_srt))
+    return words
 
-    return subtitle_data
 
 def download_youtube_video(url, output_path):
     try:
         yt = YouTube(url)
         stream = yt.streams.filter(only_video=True, file_extension="mp4").first()
         if stream:
-            stream.download(output_path=os.path.dirname(output_path), filename=os.path.basename(output_path))
+            stream.download(
+                output_path=os.path.dirname(output_path),
+                filename=os.path.basename(output_path),
+            )
             return True
         else:
-            print(f"No video stream found for URL: {url}")
+            logging.error(f"No video stream found for URL: {url}")
             return False
     except Exception as e:
-        print(f"Error downloading YouTube video: {e}")
+        logging.error(f"Error downloading YouTube video: {e}")
         traceback.print_exc()
         return False
 
-def crop_center_square_and_resize(clip, size=(512, 512)):
-    # Crop the video to a 1:1 aspect ratio (square format) and resize to specified size
-    width, height = clip.size
-    if width != height:
-        min_dimension = min(width, height)
-        x_center = width / 2
-        y_center = height / 2
-        x1 = x_center - min_dimension / 2
-        y1 = y_center - min_dimension / 2
-        x2 = x_center + min_dimension / 2
-        y2 = y_center + min_dimension / 2
-        clip = clip.crop(x1=x1, y1=y1, x2=x2, y2=y2)
+
+def crop_center_square_and_resize(clip, size=(1280, 720)):
     return clip.resize(size)
+
 
 def process_video(input_path, output_path, start_time, end_time):
     try:
-        print(f"Processing video from {start_time} to {end_time}")
-        clip = VideoFileClip(input_path).subclip(start_time, end_time)
+        logging.info(f"Processing video from {start_time} to {end_time}")
+        clip = VideoFileClip(input_path).subclip(start_time + 0.8, end_time - 0.1)
         clip = crop_center_square_and_resize(clip).set_fps(30)
         clip.write_videofile(output_path, codec="libx264", fps=30)
         clip.close()
         return True
     except Exception as e:
-        print(f"Error processing video: {e}")
+        logging.error(f"Error processing video: {e}")
         traceback.print_exc()
         return False
 
-def attempt_download_video(word, asl_data, prev_word=None, next_word=None, is_base_form=False):
+
+def attempt_download_video(
+    word, asl_data, prev_word=None, next_word=None, is_base_form=False
+):
     word_occurrences = [entry for entry in asl_data if entry.get("clean_text") == word]
 
     if len(word_occurrences) == 0:
         if not is_base_form:
             base_word = get_synonym(word, prev_word, next_word)
             if base_word != word:
-                return attempt_download_video(base_word, asl_data, prev_word, next_word, is_base_form=True)
+                return attempt_download_video(
+                    base_word, asl_data, prev_word, next_word, is_base_form=True
+                )
         return None
 
     for item in word_occurrences:
@@ -128,8 +123,10 @@ def attempt_download_video(word, asl_data, prev_word=None, next_word=None, is_ba
 
     return None
 
+
 def get_base_form(word):
     return lemmatizer.lemmatize(word)
+
 
 def get_synonym(word, prev_word=None, next_word=None):
     url = f"https://api.datamuse.com/words?rel_syn={word}"
@@ -155,16 +152,17 @@ def get_synonym(word, prev_word=None, next_word=None):
             if context_synonyms:
                 synonym_list = [item["word"] for item in context_synonyms]
 
-        print(f"SYNONIM: {synonym_list[0]}")
         return synonym_list[0]
 
     except requests.RequestException as e:
-        print(f"Error fetching synonyms: {e}")
+        logging.error(f"Error fetching synonyms: {e}")
         return word
+
 
 def process_subtitle_data(word, asl_data):
     word = word.replace(" ", "").lower()
     return attempt_download_video(word, asl_data)
+
 
 if __name__ == "__main__":
     json_file_path = "asl_videos.json"
@@ -178,22 +176,28 @@ if __name__ == "__main__":
             os.makedirs("videos")
 
         video_clips = []
-        video_paths = []
-        with ThreadPoolExecutor() as executor:
-            results = executor.map(lambda x: process_subtitle_data(x[0], asl_data), subtitle_data)
-            for result in results:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_word = {
+                executor.submit(process_subtitle_data, word, asl_data): word
+                for word in subtitle_data
+            }
+            for future in future_to_word:
+                result = future.result()
                 if result:
                     video_path = result
+                    logging.info(f"Processed video path: {video_path}")
                     video_clip = VideoFileClip(video_path).set_fps(30)
                     video_clips.append(video_clip)
-                    video_paths.append(video_path)
 
         if video_clips:
             final_clip = concatenate_videoclips(video_clips, method="compose")
-            final_clip.write_videofile("concatenated_video.mp4", codec="libx264", fps=30)
+            final_clip.write_videofile(
+                "concatenated_video.mp4", codec="libx264", fps=30
+            )
             final_clip.close()
+            shutil.rmtree("videos")
+        else:
+            logging.error("No video clips to concatenate.")
 
-        for trimmed_video_path in video_paths:
-            os.remove(trimmed_video_path)
     else:
-        print("No subtitle data found or ASL data is missing.")
+        logging.error("No subtitle data found or ASL data is missing.")
